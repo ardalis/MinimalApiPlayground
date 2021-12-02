@@ -1,15 +1,16 @@
 using System.ComponentModel.DataAnnotations;
+using System.Diagnostics;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Diagnostics;
-using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.EntityFrameworkCore;
-using MinimalApiPlayground.ModelBinding;
+using Microsoft.Net.Http.Headers;
+using MinimalApis.Extensions.Binding;
+using MinimalApis.Extensions.Results;
 using MiniValidation;
-using MiniValidation.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -23,6 +24,8 @@ builder.Services.AddSqlite<TodoDb>(connectionString);
 builder.Services.AddDatabaseDeveloperPageExceptionFilter();
 builder.Services.AddProblemDetailsDeveloperPageExceptionFilter();
 builder.Services.AddParameterBinder<TodoBinder, Todo>();
+
+builder.Services.AddEndpointsProvidesMetadataApiExplorer();
 
 // This enables MVC's model binders
 builder.Services.AddMvcCore();
@@ -39,11 +42,27 @@ if (!app.Environment.IsDevelopment())
 app.UseAntiforgery();
 
 // Error handling
-app.MapGet("/error", (HttpContext context) =>
-    context.Features.Get<IExceptionHandlerFeature>()?.Error switch
+var problemJsonMediaType = new MediaTypeHeaderValue("application/problem+json");
+app.MapGet("/error", Results<Problem, StatusCode> (HttpContext context) =>
     {
-        BadHttpRequestException ex => Results.Problem(ex.Message, statusCode: ex.StatusCode),
-        _ => Results.Problem("Internal server error")
+        var error = context.Features.Get<IExceptionHandlerFeature>()?.Error;
+        var badRequestEx = error as BadHttpRequestException;
+        var statusCode = badRequestEx?.StatusCode ?? StatusCodes.Status500InternalServerError;
+
+        if (context.Request.GetTypedHeaders().Accept?.Any(h => problemJsonMediaType.IsSubsetOf(h)) == true)
+        {
+            var extensions = new Dictionary<string, object> { { "requestId", Activity.Current?.Id ?? context.TraceIdentifier } };
+
+            // JSON Problem Details
+            return error switch
+            {
+                BadHttpRequestException ex => Results.Extensions.Problem(detail: ex.Message, statusCode: ex.StatusCode, extensions: extensions),
+                _ => Results.Extensions.Problem(extensions: extensions)
+            };
+        }
+
+        // Plain text
+        return Results.Extensions.StatusCode(statusCode, badRequestEx?.Message ?? "An unhandled exception occurred while processing the request.");
     })
    .ExcludeFromDescription();
 
@@ -61,7 +80,7 @@ app.MapGet("/throw/{statusCode?}", (int? statusCode) =>
 
 // Hello World
 app.MapGet("/", () => "Hello World!")
-   .WithName("HelloWorldApi")
+   .WithName("HelloWorld")
    .WithTags("Examples");
 
 app.MapGet("/hello", () => new { Hello = "World" })
@@ -96,6 +115,15 @@ app.MapGet("/html", (HttpContext context) => Results.Extensions.Html(
 </html>"))
    .ExcludeFromDescription();
 
+// Example file output from custom IResult
+app.MapGet("/htmlfile", (HttpContext context) => Results.Extensions.FromFile("Files\\example.html"))
+   .ExcludeFromDescription();
+
+// Example file output
+app.MapGet("/getfile", (HttpContext context, IWebHostEnvironment env) =>
+    Results.File(env.ContentRootFileProvider.GetFileInfo("Files\\example.html").PhysicalPath, "text/html"))
+   .ExcludeFromDescription();
+
 // Parameter optionality
 app.MapGet("/optionality/{value?}", (string? value, int? number) =>
     {
@@ -124,26 +152,82 @@ app.MapGet("/optionality/{value?}", (string? value, int? number) =>
 app.MapGet("/point", (Point point) => $"Point: {point}")
     .WithTags("Examples");
 
-app.MapGet("/parse/{id}", (Parseable<int> id) =>
-    $"Successfully parsed {id.Value} as Parseable<int>!")
-    .WithTags("Examples");
-
 // Custom parameter binding via [TargetType].BindAsync()
 app.MapGet("/paged", (PagingData paging) =>
     $"ToString: {paging}\r\nToQueryString: {paging.ToQueryString()}")
     .WithTags("Examples");
 
+// Example of a wrapper generic type the can bind its generic argument
 app.MapGet("/wrapped/{id}", (Wrapped<int> id) =>
     $"Successfully parsed {id.Value} as Wrapped<int>!")
     .WithTags("Examples");
 
-app.MapPost("/model", (Model<Todo> model) =>
+// Example of bind logic coming from static methods defined on inherited/implemented interface
+app.MapPost("/bind-via-interface", (ExampleInput input) =>
+    $"Successfully bound {input.StringProperty} as ExampleInput!")
+    .WithTags("Examples")
+    .Accepts<ExampleInput>("application/json");
+
+// An example extensible binder system that allows for parameter binders to be configured in DI
+app.MapPost("/model", (Bind<Todo> model) =>
     {
         Todo? todo = model;
-        return Results.Ok(todo);
+        return Results.Extensions.Ok(todo);
     })
-    .WithTags("Examples")
-    .Accepts<Todo>("application/json");
+    .WithTags("Examples");
+
+app.MapPost("/model-nobinder", (Bind<NoBinder> model) =>
+    {
+        NoBinder? value = model;
+        return Results.Extensions.Ok(value);
+    })
+    .WithTags("Examples");
+
+app.MapPost("/suppress-defaults", (SuppressDefaultResponse<Todo?> todo, HttpContext httpContext) =>
+    {
+        if (todo.Exception != null)
+        {
+            // There was an exception during binding, handle it however you like
+            throw todo.Exception;
+        }
+
+        if (todo.StatusCode != 200)
+        {
+            // The default logic would have auto-responded, do what you like instead
+            throw new BadHttpRequestException("Your request was bad and you should feel bad", todo.StatusCode);
+        }
+
+        return Results.Extensions.Ok(todo.Value);
+    })
+    .WithTags("Examples");
+
+app.MapPost("/suppress-binding", async Task<Results<BadRequest, Ok<Todo>, PlainText, UnprocessableEntity>> (SuppressBinding<Todo?> todo, HttpContext httpContext) =>
+    {
+        try
+        {
+            // Manually invoke the default binding logic
+            var (boundValue, statusCode) = await DefaultBinder<Todo>.GetValueAsync(httpContext);
+
+            if (statusCode != 200)
+            {
+                // The default binding resulted in a default response, e.g. 400
+                // We can respond how we like instead
+                return Results.Extensions.BadRequest($"Issue with default binding, status code returned was {statusCode}");
+            }
+
+            return boundValue switch
+            {
+                object => Results.Extensions.Ok(boundValue),
+                _ => Results.Extensions.PlainText("Bound value was null")
+            };
+        }
+        catch (Exception ex)
+        {
+            // Exception occurred during default binding!
+            return Results.Extensions.UnprocessableEntity(ex.ToString());
+        }
+    })
+    .WithTags("Examples");
 
 // Using MVC's model binding logic via a generic wrapping shim
 app.MapGet("/paged2", (ModelBinder<PagedData> paging) =>
@@ -170,70 +254,75 @@ app.MapGet("/todos/sample", () => new[] {
 
 app.MapGet("/todos", async (TodoDb db) => await db.Todos.ToListAsync())
    .WithName("GetAllTodos")
-   .WithTags("TodoApi")
-   .Produces<List<Todo>>();
+   .WithTags("TodoApi");
 
 app.MapGet("/todos/incompleted", async (TodoDb db) => await db.Todos.Where(t => !t.IsComplete).ToListAsync())
    .WithName("GetIncompletedTodos")
-   .WithTags("TodoApi")
-   .Produces<List<Todo>>();
+   .WithTags("TodoApi");
 
 app.MapGet("/todos/completed", async (TodoDb db) => await db.Todos.Where(t => t.IsComplete).ToListAsync())
    .WithName("GetCompletedTodos")
-   .WithTags("TodoApi")
-   .Produces<List<Todo>>();
+   .WithTags("TodoApi");
 
-app.MapGet("/todos/{id}", async (int id, TodoDb db) =>
+app.MapGet("/todos/{id}", async Task<Results<Ok<Todo>, NotFound>> (int id, TodoDb db) =>
     {
         return await db.Todos.FindAsync(id)
             is Todo todo
-                ? Results.Ok(todo)
-                : Results.NotFound();
+                ? Results.Extensions.Ok(todo)
+                : Results.Extensions.NotFound();
     })
     .WithName("GetTodoById")
-    .WithTags("TodoApi")
-    .Produces<Todo>()
-    .Produces(StatusCodes.Status404NotFound);
+    .WithTags("TodoApi");
 
-app.MapPost("/todos", async (Todo todo, TodoDb db) =>
+app.MapPost("/todos", async Task<Results<ValidationProblem, Created<Todo>>> (Todo todo, TodoDb db) =>
     {
         if (!MiniValidator.TryValidate(todo, out var errors))
-            return Results.ValidationProblem(errors);
+            return Results.Extensions.ValidationProblem(errors);
 
         db.Todos.Add(todo);
         await db.SaveChangesAsync();
 
-        return Results.Created($"/todo/{todo.Id}", todo);
+        return Results.Extensions.Created($"/todo/{todo.Id}", todo);
     })
     .WithName("AddTodo")
-    .WithTags("TodoApi")
-    .ProducesValidationProblem()
-    .Produces<Todo>(StatusCodes.Status201Created);
+    .WithTags("TodoApi");
+
+// Example of a custom DTO base type that could use abstract 
+app.MapPost("/todos/dto", Results<ValidationProblem, Created<Todo>> (CreateTodoInput input, TodoDb db) =>
+    {
+        if (!MiniValidator.TryValidate(input, out var errors))
+            return Results.Extensions.ValidationProblem(errors);
+
+        // Process the DTO here
+        var newTodo = new Todo { Id = 1, Title = input.Title };
+
+        return Results.Extensions.Created($"/todo/{newTodo.Id}", newTodo);
+    })
+    .WithName("AddTodoViaDto")
+    .WithTags("TodoApi");
 
 // Example of a custom wrapper type that performs validation
-app.MapPost("/todos/validated-wrapper", async (Validated<Todo> inputTodo, TodoDb db) =>
+app.MapPost("/todos/validated-wrapper", async Task<Results<ValidationProblem, Created<Todo>>> (Validated<Todo> inputTodo, TodoDb db) =>
     {
         var (todo, isValid) = inputTodo;
         if (!isValid || todo == null)
-            return Results.ValidationProblem(inputTodo.Errors);
+            return Results.Extensions.ValidationProblem(inputTodo.Errors);
 
         db.Todos.Add(todo);
         await db.SaveChangesAsync();
 
-        return Results.Created($"/todo/{todo.Id}", todo);
+        return Results.Extensions.Created($"/todo/{todo.Id}", todo);
     })
     .WithName("AddTodo_ValidatedWrapper")
     .WithTags("TodoApi")
-    .Accepts<Todo>("application/json")
-    .ProducesValidationProblem()
-    .Produces<Todo>(StatusCodes.Status201Created);
+    .Accepts<Todo>("application/json");
 
 // Example of adding an endpoint via a local function MethodGroup with attributes to describe it
 app.MapPost("/todos-local-func", AddTodoFunc);
 
 // EndpointName set automatically to name of method
-[ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
-[ProducesResponseType(typeof(Todo), StatusCodes.Status201Created)]
+[Mvc.ProducesResponseType(typeof(Mvc.ValidationProblemDetails), StatusCodes.Status400BadRequest)]
+[Mvc.ProducesResponseType(typeof(Todo), StatusCodes.Status201Created)]
 [EndpointName(nameof(AddTodoFunc))]
 [Tags("TodoApi")]
 async Task<IResult> AddTodoFunc(Todo todo, TodoDb db)
@@ -248,34 +337,31 @@ async Task<IResult> AddTodoFunc(Todo todo, TodoDb db)
 }
 
 // Example of manually supporting more than JSON for input/output
-app.MapPost("/todos/xmlorjson", async (HttpRequest request, TodoDb db) =>
+app.MapPost("/todos/xmlorjson", async Task<Results<UnsupportedMediaType, ValidationProblem, CreatedJsonOrXml<Todo>>> (HttpRequest request, TodoDb db) =>
     {
         string contentType = request.Headers.ContentType;
 
         var todo = contentType switch
         {
-            "application/json" => await request.Body.ReadAsJsonAsync<Todo>(),
-            "application/xml" => await request.Body.ReadAsXmlAsync<Todo>(request.ContentLength),
+            "application/json" => await request.ReadFromJsonAsync<Todo>(),
+            "application/xml" => await request.ReadFromXmlAsync<Todo>(request.ContentLength),
             _ => null,
         };
 
         if (todo is null)
-            return Results.StatusCode(StatusCodes.Status415UnsupportedMediaType);
+            return Results.Extensions.UnsupportedMediaType();
 
         if (!MiniValidator.TryValidate(todo, out var errors))
-            return Results.ValidationProblem(errors);
+            return Results.Extensions.ValidationProblem(errors);
 
         db.Todos.Add(todo);
         await db.SaveChangesAsync();
 
-        return Results.Extensions.CreatedWithContentType(todo, contentType);
+        return Results.Extensions.CreatedJsonOrXml(todo, contentType);
     })
     .WithName("AddTodoXmlOrJson")
     .WithTags("TodoApi")
-    .Accepts<Todo>("application/json", "application/xml")
-    .Produces(StatusCodes.Status415UnsupportedMediaType)
-    .ProducesValidationProblem()
-    .Produces<Todo>(StatusCodes.Status201Created, "application/json", "application/xml");
+    .Accepts<Todo>("application/json", "application/xml");
 
 // Example of manually supporting file upload (comment out RequiresAntiforgery() line to allow POST from browser)
 app.MapGet("/todos/fromfile", (HttpContext httpContext, IAntiforgery antiforgery) =>
@@ -285,21 +371,20 @@ app.MapGet("/todos/fromfile", (HttpContext httpContext, IAntiforgery antiforgery
         return tokenSet;
     })
     .WithName("AddTodosFromFile_GetAntiXsrfToken")
-    .WithTags("TodoApi")
-    .Produces<AntiforgeryTokenSet>();
+    .WithTags("TodoApi");
 
-app.MapPost("/todos/fromfile", async (JsonFormFile<List<Todo>> todosFile, TodoDb db) =>
+app.MapPost("/todos/fromfile", async Task<Results<ValidationProblem, Created<List<Todo>>>> (JsonFormFile<List<Todo>> todosFile, TodoDb db) =>
     {
         var todos = todosFile.Value;
 
         if (!(todos?.Count > 0))
-            return Results.BadRequest();
+            return Results.Extensions.ValidationProblem(new () { { nameof(todosFile), new[] { "The uploaded file contained no todos." } } });
 
         var todoCount = 0;
         foreach (var todo in todos)
         {
             if (!MiniValidator.TryValidate(todo, out var errors))
-                return Results.ValidationProblem(errors.ToDictionary(entry => $"[{todoCount}].{entry.Key}", entry => entry.Value));
+                return Results.Extensions.ValidationProblem(errors.ToDictionary(entry => $"[{todoCount}].{entry.Key}", entry => entry.Value));
 
             db.Todos.Add(todo);
             todoCount++;
@@ -307,101 +392,85 @@ app.MapPost("/todos/fromfile", async (JsonFormFile<List<Todo>> todosFile, TodoDb
 
         await db.SaveChangesAsync();
 
-        return Results.Created(string.Join(';', todos.Select(t => $"/todo/{t.Id}")), todos);
+        return Results.Extensions.Created(string.Join(';', todos.Select(t => $"/todo/{t.Id}")), todos);
     })
     .WithName("AddTodosFromFile")
-    .WithTags("TodoApi")
-    .AcceptsFormFile("todosFile")
-    //.RequiresAntiforgery()
-    .Produces(StatusCodes.Status400BadRequest)
-    .Produces(StatusCodes.Status415UnsupportedMediaType)
-    .ProducesValidationProblem()
-    .Produces<List<Todo>>(StatusCodes.Status201Created);
+    .WithTags("TodoApi");
 
-app.MapPut("/todos/{id}", async (int id, Todo inputTodo, TodoDb db) =>
+app.MapPut("/todos/{id}", async Task<Results<ValidationProblem, NoContent, NotFound>> (int id, Todo inputTodo, TodoDb db) =>
     {
         if (!MiniValidator.TryValidate(inputTodo, out var errors))
-            return Results.ValidationProblem(errors);
+            return Results.Extensions.ValidationProblem(errors);
 
         if (await db.Todos.FindAsync(id) is Todo todo)
         {
             todo.Title = inputTodo.Title;
             todo.IsComplete = inputTodo.IsComplete;
             await db.SaveChangesAsync();
-            return Results.NoContent();
+            return Results.Extensions.NoContent();
         }
         else
         {
-            return Results.NotFound();
+            return Results.Extensions.NotFound();
         }
     })
     .WithName("UpdateTodo")
-    .WithTags("TodoApi")
-    .ProducesValidationProblem()
-    .Produces(StatusCodes.Status204NoContent)
-    .Produces(StatusCodes.Status404NotFound);
+    .WithTags("TodoApi");
 
-app.MapPut("/todos/{id}/mark-complete", async (int id, TodoDb db) =>
+app.MapPut("/todos/{id}/mark-complete", async Task<Results<NoContent, NotFound>> (int id, TodoDb db) =>
     {
         if (await db.Todos.FindAsync(id) is Todo todo)
         {
             todo.IsComplete = true;
             await db.SaveChangesAsync();
-            return Results.NoContent();
+            return Results.Extensions.NoContent();
         }
         else
         {
-            return Results.NotFound();
+            return Results.Extensions.NotFound();
         }
     })
     .WithName("CompleteTodo")
-    .WithTags("TodoApi")
-    .Produces(StatusCodes.Status204NoContent)
-    .Produces(StatusCodes.Status404NotFound);
+    .WithTags("TodoApi");
 
-app.MapPut("/todos/{id}/mark-incomplete", async (int id, TodoDb db) =>
+app.MapPut("/todos/{id}/mark-incomplete", async Task<Results<NoContent, NotFound>> (int id, TodoDb db) =>
     {
         if (await db.Todos.FindAsync(id) is Todo todo)
         {
             todo.IsComplete = false;
             await db.SaveChangesAsync();
-            return Results.NoContent();
+            return Results.Extensions.NoContent();
         }
         else
         {
-            return Results.NotFound();
+            return Results.Extensions.NotFound();
         }
     })
     .WithName("UncompleteTodo")
-    .WithTags("TodoApi")
-    .Produces(StatusCodes.Status204NoContent)
-    .Produces(StatusCodes.Status404NotFound);
+    .WithTags("TodoApi");
 
-app.MapDelete("/todos/{id}", async (int id, TodoDb db) =>
+app.MapDelete("/todos/{id}", async Task<Results<Ok<Todo>, NotFound>> (int id, TodoDb db) =>
     {
         if (await db.Todos.FindAsync(id) is Todo todo)
         {
             db.Todos.Remove(todo);
             await db.SaveChangesAsync();
-            return Results.Ok(todo);
+            return Results.Extensions.Ok(todo);
         }
 
-        return Results.NotFound();
+        return Results.Extensions.NotFound();
     })
     .WithName("DeleteTodo")
-    .WithTags("TodoApi")
-    .Produces<Todo>()
-    .Produces(StatusCodes.Status404NotFound);
+    .WithTags("TodoApi");
 
-app.MapDelete("/todos/delete-all", async (TodoDb db) =>
+app.MapDelete("/todos/delete-all", async Task<Ok<int>> (TodoDb db) =>
     {
         var rowCount = await db.Database.ExecuteSqlRawAsync("DELETE FROM Todos");
 
-        return Results.Ok(rowCount);
+        return Results.Extensions.Ok(rowCount);
     })
     .WithName("DeleteAllTodos")
-    .WithTags("TodoApi")
-    .Produces<int>();
+    .WithTags("TodoApi");
 
 app.Run();
 
@@ -439,6 +508,16 @@ public class TodoBinder : IParameterBinder<Todo>
 
         return todo;
     }
+}
+
+public class NoBinder
+{
+    public string? Name { get; set; } = $"Default value set by {nameof(NoBinder)}";
+}
+
+public class ExampleInput : IInterfaceBinder<ExampleInput>
+{
+    public string? StringProperty { get; set; }
 }
 
 public class TodoDb : DbContext
